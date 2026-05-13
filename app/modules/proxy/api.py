@@ -1887,7 +1887,7 @@ async def _probe_stream_startup_error(
     convert_event_errors: bool = False,
     timeout_seconds: float = _STREAM_STARTUP_ERROR_PROBE_SECONDS,
 ) -> tuple[AsyncIterator[str], ProxyResponseError | OpenAIErrorEnvelopeModel | None]:
-    first_task = asyncio.create_task(anext(stream))
+    first_task = asyncio.create_task(_await_first_stream_item(stream))
     try:
         first = await asyncio.wait_for(
             asyncio.shield(first_task),
@@ -1899,13 +1899,14 @@ async def _probe_stream_startup_error(
         return _prepend_first(None, stream), None
     except ProxyResponseError as exc:
         return _prepend_first(None, stream), exc
-    if convert_event_errors:
-        first_error = _stream_event_error_envelope(first)
-        if first_error is not None:
-            aclose = getattr(stream, "aclose", None)
-            if callable(aclose):
-                await aclose()
-            return _prepend_first(None, stream), first_error
+    first_error = _stream_event_error_envelope(first)
+    if first_error is not None and (convert_event_errors or _should_surface_startup_event_error(first_error)):
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
+            close_result = aclose()
+            if inspect.isawaitable(close_result):
+                await close_result
+        return _prepend_first(None, stream), first_error
     return _prepend_first(first, stream), None
 
 
@@ -1916,6 +1917,10 @@ async def _prepend_first_task(first_task: asyncio.Task[str], stream: AsyncIterat
         return
     async for line in stream:
         yield line
+
+
+async def _await_first_stream_item(stream: AsyncIterator[str]) -> str:
+    return await stream.__anext__()
 
 
 async def _stream_proxy_errors_as_response_failed(stream: AsyncIterator[str]) -> AsyncIterator[str]:
@@ -1934,6 +1939,13 @@ async def _stream_proxy_errors_as_response_failed(stream: AsyncIterator[str]) ->
                 error_param=error.param if error else None,
             )
         )
+
+
+def _should_surface_startup_event_error(error: OpenAIErrorEnvelopeModel) -> bool:
+    parsed = error.error
+    if parsed is None:
+        return False
+    return _status_for_error(parsed) == 429
 
 
 def _stream_startup_error_response(
@@ -1999,6 +2011,8 @@ def _logged_error_json_response(
     effective_headers = dict(headers or {})
     if status_code == 429 and is_local_overload_error_code(code):
         effective_headers = merge_retry_after_headers(effective_headers)
+    elif status_code == 429:
+        effective_headers = _merge_rate_limit_retry_after_headers(effective_headers, content)
     log_error_response(
         logger,
         request,
@@ -2027,6 +2041,61 @@ def _error_details_from_content(
     code = error_mapping.get("code")
     message = error_mapping.get("message")
     return code if isinstance(code, str) else None, message if isinstance(message, str) else None
+
+
+def _merge_rate_limit_retry_after_headers(
+    headers: Mapping[str, str],
+    content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
+) -> dict[str, str]:
+    merged = dict(headers)
+    if any(key.lower() == "retry-after" for key in merged):
+        return merged
+    retry_after = _retry_after_header_from_content(content)
+    if retry_after is None:
+        return merged
+    merged["Retry-After"] = retry_after
+    return merged
+
+
+def _retry_after_header_from_content(
+    content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
+) -> str | None:
+    error = _error_from_content(content)
+    if error is None:
+        return None
+    if error.resets_in_seconds is not None:
+        return _retry_after_seconds_value(error.resets_in_seconds)
+    if error.resets_at is not None:
+        remaining = float(error.resets_at) - time.time()
+        if remaining <= 0:
+            return None
+        return _retry_after_seconds_value(remaining)
+    return None
+
+
+def _error_from_content(
+    content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
+) -> OpenAIError | None:
+    if isinstance(content, OpenAIErrorEnvelopeModel):
+        return content.error
+    if not isinstance(content, Mapping):
+        return None
+    error = content.get("error")
+    if not is_json_mapping(error):
+        return None
+    try:
+        return OpenAIError.model_validate(error)
+    except ValidationError:
+        return None
+
+
+def _retry_after_seconds_value(seconds: int | float) -> str | None:
+    rounded = int(seconds)
+    if float(seconds) > rounded:
+        rounded += 1
+    if rounded <= 0:
+        rounded = 1
+    return str(rounded)
 
 
 async def _validate_proxy_websocket_request(
