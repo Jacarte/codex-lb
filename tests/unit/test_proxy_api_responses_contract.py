@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import cast
 
 import pytest
 
 import app.modules.proxy.api as proxy_api_module
+from app.core.openai.models import OpenAIErrorEnvelope
 
 pytestmark = pytest.mark.unit
 
@@ -12,6 +14,59 @@ pytestmark = pytest.mark.unit
 async def _iter_blocks(*blocks: str) -> AsyncIterator[str]:
     for block in blocks:
         yield block
+
+
+@pytest.mark.asyncio
+async def test_probe_stream_startup_error_surfaces_rate_limit_response_failed_event() -> None:
+    stream, error = await proxy_api_module._probe_stream_startup_error(
+        _iter_blocks(
+            (
+                'data: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded",'
+                '"type":"rate_limit_error","message":"slow down","resets_in_seconds":2}}}\n\n'
+            )
+        )
+    )
+
+    assert error is not None
+    envelope = cast(OpenAIErrorEnvelope, error)
+    assert envelope.error is not None
+    assert envelope.error.code == "rate_limit_exceeded"
+    assert envelope.error.resets_in_seconds == 2
+    remaining = [block async for block in stream]
+    assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_probe_stream_startup_error_keeps_non_rate_limit_response_failed_event_in_stream() -> None:
+    stream, error = await proxy_api_module._probe_stream_startup_error(
+        _iter_blocks(
+            'data: {"type":"response.failed","response":{"error":{"code":"no_accounts","message":"none"}}}\n\n'
+        )
+    )
+
+    assert error is None
+    blocks = [block async for block in stream]
+    assert len(blocks) == 1
+    payload = proxy_api_module._parse_sse_payload(blocks[0])
+    assert payload is not None
+    assert payload["type"] == "response.failed"
+
+
+def test_retry_after_header_from_rate_limit_error_content_uses_resets_in_seconds() -> None:
+    envelope = proxy_api_module.OpenAIErrorEnvelopeModel.model_validate(
+        {
+            "error": {
+                "code": "rate_limit_exceeded",
+                "type": "rate_limit_error",
+                "message": "slow down",
+                "resets_in_seconds": 2,
+            }
+        }
+    )
+
+    headers = proxy_api_module._merge_rate_limit_retry_after_headers({}, envelope)
+
+    assert headers["Retry-After"] == "2"
 
 
 @pytest.mark.asyncio

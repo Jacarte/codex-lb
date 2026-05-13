@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, Mapping, cast
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -20,13 +20,13 @@ from app.modules.request_logs.repository import RequestLogsRepository
 pytestmark = pytest.mark.integration
 
 
-def _encode_jwt(payload: dict) -> str:
+def _encode_jwt(payload: Mapping[str, object]) -> str:
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     body = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
     return f"header.{body}.sig"
 
 
-def _make_auth_json(account_id: str, email: str) -> dict:
+def _make_auth_json(account_id: str, email: str) -> dict[str, object]:
     payload = {
         "email": email,
         "chatgpt_account_id": account_id,
@@ -42,7 +42,7 @@ def _make_auth_json(account_id: str, email: str) -> dict:
     }
 
 
-def _extract_first_event(lines: list[str]) -> dict:
+def _extract_first_event(lines: list[str]) -> Any:
     for line in lines:
         if line.startswith("data: "):
             return json.loads(line[6:])
@@ -186,6 +186,36 @@ async def test_v1_responses_routes(async_client):
     assert event["response"]["status"] == "failed"
     assert event["response"]["id"] == request_id
     assert event["response"]["error"]["code"] == "no_accounts"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_startup_rate_limit_event_returns_http_429(async_client, monkeypatch):
+    email = "startup-rate-limit@example.com"
+    raw_account_id = "acc_startup_rate_limit"
+    auth_json = _make_auth_json(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del payload, headers, access_token, account_id, base_url, raise_for_status, kwargs
+        yield (
+            'data: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded",'
+            '"type":"rate_limit_error","message":"slow down","resets_in_seconds":2}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.1", "input": "hi"},
+    )
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "2"
+    body = response.json()
+    assert body["error"]["code"] == "rate_limit_exceeded"
+    assert body["error"]["type"] == "rate_limit_error"
 
 
 @pytest.mark.asyncio
