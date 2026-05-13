@@ -4507,7 +4507,7 @@ async def test_backend_responses_http_bridge_startup_error_omits_turn_state_head
     )
 
     assert response.status_code == 503
-    assert response.json()["error"]["code"] == "no_accounts"
+    assert response.json()["error"]["code"] == "service_unavailable"
     assert "x-codex-turn-state" not in response.headers
 
 
@@ -4525,7 +4525,7 @@ async def test_v1_responses_http_bridge_startup_error_omits_turn_state_header(as
     )
 
     assert response.status_code == 503
-    assert response.json()["error"]["code"] == "no_accounts"
+    assert response.json()["error"]["code"] == "service_unavailable"
     assert "x-codex-turn-state" not in response.headers
 
 

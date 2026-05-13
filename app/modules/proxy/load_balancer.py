@@ -79,6 +79,10 @@ class AccountSelection:
     account: Account | None
     error_message: str | None
     error_code: str | None = None
+    public_status_code: int | None = None
+    public_error_code: str | None = None
+    public_error_type: str | None = None
+    retry_after_seconds: int | float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,7 +384,18 @@ class LoadBalancer:
             if error_message == "No available accounts":
                 set_degraded("all upstream accounts are unavailable")
                 error_message = _format_degraded_error_message(error_message)
-            return AccountSelection(account=None, error_message=error_message, error_code=None)
+            public_status_code, public_error_code, public_error_type, retry_after_seconds = (
+                _classify_public_selection_error(error_message)
+            )
+            return AccountSelection(
+                account=None,
+                error_message=error_message,
+                error_code=None,
+                public_status_code=public_status_code,
+                public_error_code=public_error_code,
+                public_error_type=public_error_type,
+                retry_after_seconds=retry_after_seconds,
+            )
         logger.info(
             "Selected account_id=%s strategy=%s sticky=%s model=%s",
             selected_snapshot.id,
@@ -1174,6 +1189,37 @@ def _filter_accounts_for_model(accounts: list[Account], model: str) -> list[Acco
 
 def _selectable_accounts(accounts: list[Account]) -> list[Account]:
     return [account for account in accounts if account.status not in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED)]
+
+
+def _classify_public_selection_error(
+    error_message: str | None,
+) -> tuple[int, str, str, int | None]:
+    message = (error_message or "No active accounts available").strip()
+    wait_seconds = _extract_wait_seconds(message)
+    lowered = message.lower()
+    if "rate limit exceeded" in lowered or wait_seconds is not None:
+        return 429, "rate_limit_exceeded", "rate_limit_error", wait_seconds
+    return 503, "service_unavailable", "server_error", None
+
+
+def _extract_wait_seconds(message: str) -> int | None:
+    marker = "try again in "
+    lowered = message.lower()
+    idx = lowered.find(marker)
+    if idx == -1:
+        return None
+    start = idx + len(marker)
+    digits: list[str] = []
+    for char in lowered[start:]:
+        if char.isdigit():
+            digits.append(char)
+            continue
+        if digits:
+            break
+    if not digits:
+        return None
+    value = int("".join(digits))
+    return value if value > 0 else None
 
 
 def _gated_limit_name_for_model(model: str | None) -> str | None:

@@ -1570,11 +1570,12 @@ class ProxyService:
                 if not account:
                     if last_exc is not None:
                         raise last_exc
-                    log_error_code = selection.error_code or "no_accounts"
-                    log_error_message = selection.error_message or "No active accounts available"
+                    status_code, error_payload, log_error_code, log_error_message, _retry_after = (
+                        _selection_public_error(selection)
+                    )
                     raise ProxyResponseError(
-                        503,
-                        openai_error(log_error_code, log_error_message),
+                        status_code,
+                        error_payload,
                     )
                 account_id_value = account.id
                 remaining_budget = _remaining_budget_seconds(deadline)
@@ -1838,11 +1839,12 @@ class ProxyService:
             )
             account = selection.account
             if not account:
-                log_error_code = selection.error_code or "no_accounts"
-                log_error_message = selection.error_message or "No active accounts available"
+                status_code, error_payload, log_error_code, log_error_message, _retry_after = _selection_public_error(
+                    selection
+                )
                 raise ProxyResponseError(
-                    503,
-                    openai_error(log_error_code, log_error_message),
+                    status_code,
+                    error_payload,
                 )
             account_id_value = account.id
 
@@ -2254,11 +2256,12 @@ class ProxyService:
             )
             account = selection.account
             if not account:
-                log_error_code = selection.error_code or "no_accounts"
-                log_error_message = selection.error_message or "No active accounts available"
+                status_code, error_payload, log_error_code, log_error_message, _retry_after = _selection_public_error(
+                    selection
+                )
                 raise ProxyResponseError(
-                    503,
-                    openai_error(log_error_code, log_error_message),
+                    status_code,
+                    error_payload,
                 )
             account_id_value = account.id
 
@@ -3253,8 +3256,7 @@ class ProxyService:
             return None
         if account:
             return account
-        error_code = selection.error_code or "no_accounts"
-        error_message = selection.error_message or "No active accounts available"
+        status_code, error_payload, error_code, error_message, _retry_after = _selection_public_error(selection)
         if require_preferred_account and preferred_account_id is not None:
             message = "Previous response owner account is unavailable; retry later."
             _record_continuity_fail_closed(
@@ -3286,12 +3288,8 @@ class ProxyService:
             account_id=None,
             api_key=api_key,
             request_state=request_state,
-            status_code=503,
-            payload=openai_error(
-                error_code,
-                error_message,
-                error_type="server_error",
-            ),
+            status_code=status_code,
+            payload=error_payload,
             error_code=error_code,
             error_message=error_message,
         )
@@ -4860,13 +4858,12 @@ class ProxyService:
                     preferred_account_id=preferred_account_id,
                     selected_account_id=None,
                 )
+                status_code, error_payload, _log_error_code, _log_error_message, _retry_after = _selection_public_error(
+                    selection
+                )
                 raise ProxyResponseError(
-                    503,
-                    openai_error(
-                        selection.error_code or "no_accounts",
-                        selection.error_message or "No active accounts available",
-                        error_type="server_error",
-                    ),
+                    status_code,
+                    error_payload,
                 )
             if require_preferred_account and preferred_account_id is not None and account.id != preferred_account_id:
                 message = "Previous response owner account is unavailable; retry later."
@@ -5475,13 +5472,12 @@ class ProxyService:
                     preferred_account_id=session.account.id,
                     selected_account_id=None,
                 )
+                status_code, error_payload, _log_error_code, _log_error_message, _retry_after = _selection_public_error(
+                    selection
+                )
                 raise ProxyResponseError(
-                    503,
-                    openai_error(
-                        selection.error_code or "no_accounts",
-                        selection.error_message or "No active accounts available",
-                        error_type="server_error",
-                    ),
+                    status_code,
+                    error_payload,
                 )
             selected_is_preferred = account.id == session.account.id
             try:
@@ -7160,13 +7156,16 @@ class ProxyService:
                     # instead of returning a generic no_accounts event.
                     if propagate_http_errors and last_transient_exc is not None:
                         raise last_transient_exc
-                    no_accounts_msg = selection.error_message or "No active accounts available"
-                    error_code = selection.error_code or "no_accounts"
+                    _status_code, _error_payload, error_code, no_accounts_msg, _retry_after = _selection_public_error(
+                        selection
+                    )
                     event = response_failed_event(
                         error_code,
                         no_accounts_msg,
                         response_id=request_id,
                     )
+                    if _retry_after is not None:
+                        event["response"]["error"]["resets_in_seconds"] = _retry_after
                     yield format_sse_event(event)
                     await self._write_request_log(
                         account_id=None,
@@ -7594,9 +7593,19 @@ class ProxyService:
             if propagate_http_errors and last_transient_exc is not None:
                 raise last_transient_exc
             retries_exhausted_msg = "No available accounts after retries"
+            retries_selection = AccountSelection(
+                account=None,
+                error_message=retries_exhausted_msg,
+                public_status_code=503,
+                public_error_code="service_unavailable",
+                public_error_type="server_error",
+            )
+            _status_code, _error_payload, error_code, error_message, _retry_after = _selection_public_error(
+                retries_selection
+            )
             event = response_failed_event(
-                "no_accounts",
-                retries_exhausted_msg,
+                error_code,
+                error_message,
                 response_id=request_id,
             )
             yield format_sse_event(event)
@@ -7608,8 +7617,8 @@ class ProxyService:
                     model=payload.model,
                     latency_ms=int((time.monotonic() - start) * 1000),
                     status="error",
-                    error_code="no_accounts",
-                    error_message=retries_exhausted_msg,
+                    error_code=error_code,
+                    error_message=error_message,
                     reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                     transport=request_transport,
                     service_tier=payload.service_tier,
@@ -8716,6 +8725,28 @@ def _normalize_http_bridge_error_event(
     normalized_payload = parse_sse_data_json(normalized_event_block)
     parsed_event = parse_sse_event(normalized_event_block)
     return normalized_event_block, normalized_payload, parsed_event, "response.failed"
+
+
+def _selection_public_error(selection: AccountSelection) -> tuple[int, OpenAIErrorEnvelope, str, str, int | None]:
+    status_code = selection.public_status_code or 503
+    error_code = selection.public_error_code or selection.error_code or "service_unavailable"
+    error_message = selection.error_message or "No active accounts available"
+    error_type = selection.public_error_type or "server_error"
+    payload = openai_error(error_code, error_message, error_type=error_type)
+    retry_after = _selection_retry_after_seconds(selection)
+    if retry_after is not None:
+        payload["error"]["resets_in_seconds"] = retry_after
+    return status_code, payload, error_code, error_message, retry_after
+
+
+def _selection_retry_after_seconds(selection: AccountSelection) -> int | None:
+    value = selection.retry_after_seconds
+    if value is None:
+        return None
+    seconds = int(value)
+    if float(value) > seconds:
+        seconds += 1
+    return seconds if seconds > 0 else 1
 
 
 def _websocket_response_id(event: OpenAIEvent | None, payload: dict[str, JsonValue] | None) -> str | None:
