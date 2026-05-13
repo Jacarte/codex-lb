@@ -1370,4 +1370,7 @@ def _format_degraded_error_message(message: str | None) -> str:
     degradation_status = get_degradation_status()
     reason = degradation_status.get("reason") or "upstream capacity is currently unavailable"
     base_message = message or "Upstream unavailable"
-    return f"{base_message}. Service is operating in degraded mode: {reason}"
+    return (
+        f"{base_message}. Service unavailable: upstream capacity is temporarily unavailable; "
+        f"try again later. Degraded mode reason: {reason}"
+    )
